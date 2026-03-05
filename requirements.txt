@@ -1,0 +1,48 @@
+# YOLO-ACT Training with AVA Dataset
+# Requirements
+
+# Core Deep Learning
+torch>=2.1.0
+torchvision>=0.16.0
+
+# YOLO and Detection
+ultralytics>=8.0.0  # YOLOv8 backbone
+
+# Video Processing
+opencv-python-headless>=4.8.0
+av>=12.0.0  # PyAV for video reading
+ffmpeg-python>=0.2.0
+decord>=0.6.0  # Fast video reader
+
+# Data Processing
+Pillow>=10.0.0
+numpy>=1.24.0
+pandas>=2.0.0
+scipy>=1.11.0
+scikit-learn>=1.3.0
+
+# Video Downloading
+yt-dlp>=2023.12.30
+aria2p>=0.1.0
+
+# Logging and Visualization
+tensorboard>=2.14.0
+wandb>=0.15.0
+tqdm>=4.65.0
+
+# Dataset Management
+fiftyone>=0.21.0  # Optional: for dataset inspection
+
+# Utilities
+pyyaml>=6.0
+pathlib2>=2.3.0
+requests>=2.31.0
+cryptography>=41.0.0  # For checkpoint encryption
+
+# For development
+pytest>=7.4.0
+black>=23.7.0
+flake8>=6.1.0
+
+# System dependencies (install separately):
+# sudo apt install ffmpeg aria2

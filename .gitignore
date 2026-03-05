@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.pth
+*.pt
+.env
+logs/
+data/raw_videos/
+data/frames/
+wandb/
+.pytest_cache/
+
