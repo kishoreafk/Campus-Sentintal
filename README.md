@@ -1,687 +1,374 @@
-# YOLO-ACT Training Pipeline with AVA Dataset
+# YOLO-ACT — Real-time Action Detection on AVA Dataset
 
-A complete pipeline to train YOLO-ACT (Real-time Spatio-Temporal Action Detection) model using the AVA (Atomic Visual Actions) dataset.
+End-to-end pipeline: **download annotations → filter class → download videos → extract frames → train model**.
 
-## 📋 Table of Contents
+---
 
-- [Overview](#overview)
-- [Features](#features)
-- [Project Structure](#project-structure)
-- [Requirements](#requirements)
-- [Installation](#installation)
-- [Running Tests](#running-tests)
-- [Quick Start](#quick-start)
-- [Pipeline Components](#pipeline-components)
-- [Training Guide](#training-guide)
-- [Configuration](#configuration)
-- [AVA Dataset Classes](#ava-dataset-classes)
-- [Troubleshooting](#troubleshooting)
-
-## 🔍 Overview
-
-This pipeline implements a complete end-to-end workflow for training action detection models:
-
-1. **Download** AVA videos with multi-source fallback (CVDF → HuggingFace → YouTube)
-2. **Validate** dataset integrity (completeness, corruption, duplicates)
-3. **Extract** frames from videos (AVA annotated window: 902–1798 s)
-4. **Train** YOLO-ACT model (YOLOv8 backbone + temporal encoder)
-
-## ✨ Features
-
-- 🎬 **Multi-Source Video Download**: Downloads from CVDF/Facebook mirror, HuggingFace, or YouTube
-- 🔄 **Duplicate Avoidance**: Skip already downloaded videos
-- ✅ **Dataset Validation**: Comprehensive integrity checking
-- ⚡ **GPU Acceleration**: Full CUDA support for training
-- 📊 **Mixed Precision**: Automatic Mixed Precision (AMP) for faster training
-- 🧠 **Temporal Modeling**: 3D-Conv + Transformer temporal encoder
-- 💾 **Checkpoint Management**: Save best / last / encrypted checkpoints
-
-## 📁 Project Structure
-
-```
-d:/Campus/
-├── config/
-│   ├── ava_classes.py           # AVA 80 class mappings & helper functions
-│   └── training_config.py       # Training hyperparameters & class weights
-├── scripts/
-│   ├── download_orchestrator.py  # Multi-source video downloader
-│   ├── validate_dataset.py       # Dataset validation
-│   ├── check_existing.py         # Check for existing videos
-│   ├── extract_frames.py         # Video → frame extraction (Decord/ffmpeg)
-│   ├── evaluate.py               # AVA mAP evaluation
-│   └── train_yolo_act.py         # Full model training script
-├── models/
-│   ├── yolo_act.py               # YOLO-ACT model (YOLOv8 + temporal head)
-│   └── checkpoints/              # Saved model weights
-├── tests/
-│   ├── __init__.py
-│   └── test_yolo_act.py          # Unit tests (22 tests)
-├── data/
-│   ├── raw_videos/               # Downloaded videos
-│   ├── frames/                   # Extracted frames (train/ & val/)
-│   └── annotations/              # AVA CSV annotations
-├── pipeline.py                   # Main orchestration script
-├── requirements.txt              # Python dependencies
-└── README.md                     # This file
-```
-
-## 💾 Requirements
-
-### System Dependencies
+## Prerequisites
 
 | Tool | Purpose | Install |
 |------|---------|---------|
-| Python 3.10+ | Runtime | https://python.org |
-| ffmpeg | Video decoding / frame extraction | `apt install ffmpeg` or https://ffmpeg.org |
-| aria2 | Parallel download acceleration | `apt install aria2` |
+| **Python 3.10+** | Runtime | <https://python.org> |
+| **ffmpeg** | Video decoding / frame extraction | Windows: <https://ffmpeg.org/download.html> (add `bin/` to PATH) · Linux: `sudo apt install ffmpeg` |
+| **aria2** *(optional)* | Parallel download acceleration | Windows: <https://github.com/aria2/aria2/releases> · Linux: `sudo apt install aria2` |
+| **yt-dlp** *(optional)* | YouTube fallback source | `pip install yt-dlp` |
+| **CUDA GPU** *(recommended)* | Training acceleration | <https://developer.nvidia.com/cuda-downloads> |
 
-On **Windows**, install ffmpeg from https://ffmpeg.org/download.html and add to `PATH`.
+---
 
-### Python Packages
-
-Core packages (installed via `requirements.txt`):
-
-```
-torch>=2.1.0
-torchvision>=0.16.0
-ultralytics>=8.0.0
-opencv-python-headless>=4.8.0
-decord>=0.6.0
-Pillow>=10.0.0
-numpy>=1.24.0
-pandas>=2.0.0
-tqdm>=4.65.0
-pyyaml>=6.0
-requests>=2.31.0
-pytest>=7.4.0
-```
-
-## 🔧 Installation
-
-### 1. Clone / open the project
+## 1 — Clone & Install
 
 ```bash
-cd d:/Campus
-```
+git clone https://github.com/kishoreafk/Campus-Sentintal.git
+cd Campus-Sentintal
 
-### 2. (Recommended) Create a virtual environment
+# Create virtual environment
+python -m venv .venv
 
-```bash
-# Windows
-python -m venv venv
-venv\Scripts\activate
+# Activate
+# Windows PowerShell:
+.venv\Scripts\Activate.ps1
+# Windows CMD:
+.venv\Scripts\activate.bat
+# Linux / macOS:
+source .venv/bin/activate
 
-# Linux / macOS
-python -m venv venv
-source venv/bin/activate
-```
-
-### 3. Install all Python dependencies
-
-```bash
+# Install dependencies
 pip install -r requirements.txt
 ```
 
-### 4. Verify CUDA availability (optional but recommended)
+Verify CUDA (optional):
 
 ```bash
-python -c "import torch; print('CUDA available:', torch.cuda.is_available())"
+python -c "import torch; print('CUDA:', torch.cuda.is_available(), '|', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU only')"
 ```
 
 ---
 
-## 🧪 Running Tests
+## 2 — Run the Full Pipeline (one command)
 
-All unit tests live in `tests/test_yolo_act.py` and cover:
-
-| Test Class | What is tested |
-|------------|---------------|
-| `TestAVAClasses` | 80 class IDs, no duplicates, reverse mapping |
-| `TestTrainingConfig` | Required config fields, class weights |
-| `TestModelArchitecture` | Forward pass shape with ResNet50 fallback |
-| `TestYOLOActLoss` | Loss output is dict, values are scalars, no NaN |
-| `TestCheckpointManagement` | Save / load / best / last / cleanup |
-| `TestDataLoading` | Dataloader creation (handles empty dataset) |
-| `TestArgumentParsing` | CLI args: defaults, `--resume`, `--auto-resume` |
-| `TestEvaluation` | IoU computation correctness |
-| `TestFrameExtraction` | FrameExtractor init, AVA temporal constants |
-
-### Run all tests
+The easiest way — runs all 5 steps automatically:
 
 ```bash
-python -m pytest tests/ -v
+# Train on "kiss" action class (class ID 30)
+python pipeline.py --class-name kiss
+
+# Or use class ID directly
+python pipeline.py --class-id 30
+
+# Limit downloads for a quick test
+python pipeline.py --class-name kiss --max-videos 5 --epochs 10
 ```
 
-### Run a specific test class
-
-```bash
-python -m pytest tests/test_yolo_act.py::TestModelArchitecture -v
-```
-
-### Run a single test
-
-```bash
-python -m pytest tests/test_yolo_act.py::TestYOLOActLoss::test_loss_computation -v
-```
-
-### Expected output
-
-```
-22 passed, 5 warnings in ~4s
-```
-
-> **Note:** The warnings about `torch.amp.GradScaler` on CPU-only machines are expected and do not affect functionality.
-
----
-
-## 🚀 Quick Start
-
-### Option 1: Full pipeline (download → extract → train)
-
-```bash
-python pipeline.py
-```
-
-### Option 2: Specific action classes only
-
-```bash
-python pipeline.py --classes kiss,hug,walk,run,sit,jump,fight
-```
-
-### Option 3: Step-by-step
-
-```bash
-# Step 1: Download videos
-python scripts/download_orchestrator.py --classes kiss,hug,walk,run
-
-# Step 2: Validate dataset
-python scripts/validate_dataset.py
-
-# Step 3: Extract frames (AVA window 902–1798 s, 30 FPS, 224×224)
-python scripts/extract_frames.py --fps 30 --img-size 224
-
-# Step 4: Train
-python scripts/train_yolo_act.py --epochs 50 --batch-size 4
-```
-
----
-
-## 🔧 Pipeline Components
-
-### 1. Video Download (`scripts/download_orchestrator.py`)
-
-Downloads AVA videos with the following priority:
-1. **CVDF / Facebook S3 Mirror** — pre-cut 15-min clips (fastest, most reliable)
-2. **HuggingFace Mirrors** — community-maintained mirrors
-3. **YouTube** — fallback, trimmed to the 15-minute annotation window
-
-```bash
-python scripts/download_orchestrator.py --classes kiss,hug,walk,run
-```
-
-### 2. Dataset Validation (`scripts/validate_dataset.py`)
-
-- Completeness: expected vs downloaded count
-- Integrity: verifies no corrupted videos
-- Duplicates: filename + content-hash based
-- Annotation alignment: CSV ↔ video file
-
-```bash
-python scripts/validate_dataset.py
-```
-
-### 3. Frame Extraction (`scripts/extract_frames.py`)
-
-Extracts only the AVA annotated window (seconds 902–1798) to save disk space.
-Prefers **Decord** (10× faster) and falls back to **ffmpeg**.
-
-```bash
-# Standard extraction
-python scripts/extract_frames.py
-
-# Fast: limit to 10 videos for testing
-python scripts/extract_frames.py --max-videos 10
-
-# Custom FPS / size
-python scripts/extract_frames.py --fps 30 --img-size 416
-
-# Use ffmpeg only (no Decord)
-python scripts/extract_frames.py --no-decord
-```
-
-### 4. Model Training (`scripts/train_yolo_act.py`)
-
-Trains the YOLO-ACT model.
-
----
-
-## 🏋️ Training Guide
-
-### Basic training
-
-```bash
-python scripts/train_yolo_act.py
-```
-
-This uses the defaults from `config/training_config.py`:
-- 100 epochs, batch size 4, lr 1e-4, backbone `yolov8m.pt`
-- Saves `best_model.pth` and `last_model.pth` to `models/checkpoints/`
-
-### Custom training
-
-```bash
-python scripts/train_yolo_act.py \
-  --epochs 50 \
-  --batch-size 8 \
-  --lr 0.0001 \
-  --backbone yolov8n.pt \
-  --num-frames 16 \
-  --img-size 224 \
-  --num-workers 4
-```
-
-### Train on specific classes
-
-```bash
-python scripts/train_yolo_act.py --classes walk,run,sit,jump,fight
-```
-
-### Resume training
-
-```bash
-# Auto-resume from last checkpoint (default behaviour)
-python scripts/train_yolo_act.py
-
-# Resume from a specific checkpoint
-python scripts/train_yolo_act.py --resume models/checkpoints/checkpoint_epoch_30.pth
-
-# Resume from the best checkpoint
-python scripts/train_yolo_act.py --resume-from-best
-```
-
-### CPU training (no GPU)
-
-```bash
-python scripts/train_yolo_act.py --device cpu --no-amp
-```
-
-### All training flags
+### Pipeline flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--frame-dir` | `data/frames` | Directory of extracted frames |
-| `--checkpoint-dir` | `models/checkpoints` | Where to save checkpoints |
-| `--log-dir` | `logs` | Directory for logs |
-| `--epochs` / `-e` | `100` | Number of training epochs |
-| `--batch-size` / `-b` | `4` | Batch size |
-| `--lr` | `0.0001` | Learning rate |
-| `--weight-decay` | `0.0001` | Weight decay (AdamW) |
-| `--img-size` | `416` | Input image resolution |
-| `--num-frames` | `16` | Frames per video clip |
-| `--num-workers` | `4` | DataLoader worker threads |
-| `--save-interval` | `5` | Save checkpoint every N epochs |
+| `--class-name` | — | Action name (e.g. `kiss`, `hug`, `walk`) |
+| `--class-id` | — | AVA class ID (1–80) |
+| `--max-videos` | all | Limit number of videos per split |
+| `--source` | `auto` | `mirror` = S3 only; `auto` = S3 + YouTube fallback |
+| `--skip-download` | off | Skip annotation download (step 1) |
+| `--skip-filter` | off | Skip annotation filtering (step 2) |
+| `--skip-videos` | off | Skip video download (step 3) |
+| `--skip-extract` | off | Skip frame extraction (step 4) |
+| `--skip-train` | off | Skip model training (step 5) |
+| `--epochs` | 50 | Training epochs |
+| `--batch-size` | 4 | Batch size |
 | `--backbone` | `yolov8m.pt` | YOLOv8 backbone variant |
 | `--device` | `cuda` | `cuda` or `cpu` |
-| `--no-amp` | off | Disable mixed-precision (AMP) |
-| `--classes` | all 80 | Comma-separated class names to train |
-| `--resume` | – | Path to checkpoint to resume from |
-| `--auto-resume` | on | Auto-resume from `last_model.pth` |
-| `--resume-from-best` | off | Resume from `best_model.pth` |
-| `--keep-best-only` | on | Only save best model |
-| `--keep-last-only` | off | Only keep the latest checkpoint |
-| `--max-checkpoints` | `5` | Max regular checkpoints to retain |
-| `--encrypt-checkpoints` | off | AES-encrypt checkpoints |
-| `--encryption-key` | – | Key for encrypted checkpoints |
 
 ---
 
-## ⚙️ Configuration
+## 3 — Step-by-Step Execution
 
-### Training hyperparameters (`config/training_config.py`)
+If you prefer running each step manually:
 
-```python
-TRAINING_CONFIG = {
-    "batch_size": 4,
-    "num_epochs": 50,
-    "accumulation_steps": 4,   # effective batch = 4 * 4 = 16
-    "optimizer": "adamw",
-    "backbone_lr": 1e-5,
-    "head_lr": 1e-3,
-    "weight_decay": 1e-4,
-    "scheduler": "cosine",
-    "warmup_epochs": 5,
-    "use_amp": True,
-    "freeze_backbone_epochs": 5,
+### Step 1: Download AVA Annotations
+
+Downloads `ava_v2.2.zip` from the S3 mirror and extracts the CSV files.
+
+```bash
+python scripts/download_annotations.py
+# Output: data/annotations/ava_train_v2.2.csv, ava_val_v2.2.csv, etc.
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--output-dir` | `data/annotations` | Where to save annotation files |
+| `--force` | off | Re-download even if files exist |
+
+### Step 2: Filter Annotations for a Class
+
+Reads the full AVA CSVs, keeps only rows for your target class, and writes filtered outputs + video ID lists.
+
+```bash
+python scripts/filter_annotations.py --class-name kiss
+# Or by ID:
+python scripts/filter_annotations.py --class-id 30
+```
+
+**Output structure:**
+
+```
+training_data/class_30_kiss/
+├── filtered_annotations/
+│   ├── ava_train_v2.2_filtered.csv
+│   └── ava_val_v2.2_filtered.csv
+├── video_ids/
+│   ├── train_video_ids.txt        # one video ID per line
+│   └── val_video_ids.txt
+└── manifests/
+    ├── train_manifest.csv         # video_id, video_path, label_id, label_name
+    └── val_manifest.csv
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--annotation-dir` | `data/annotations` | Location of AVA CSVs |
+| `--output-root` | `training_data` | Base directory for class output |
+| `--class-name` | — | Action name |
+| `--class-id` | — | AVA class ID |
+
+### Step 3: Download Videos
+
+Downloads videos from the S3 AVA mirror (`.mkv` first), with optional YouTube/yt-dlp fallback. Hard-links downloaded files into the class directory to save disk space.
+
+```bash
+# Download all videos for a class (train + val splits)
+python scripts/download_videos_v2.py --class-dir training_data/class_30_kiss
+
+# Limit to 5 videos for testing
+python scripts/download_videos_v2.py --class-dir training_data/class_30_kiss --max-videos 5
+
+# S3 mirror only (no YouTube fallback)
+python scripts/download_videos_v2.py --class-dir training_data/class_30_kiss --source mirror
+
+# Download from a specific video-ID list
+python scripts/download_videos_v2.py --video-ids training_data/class_30_kiss/video_ids/train_video_ids.txt
+```
+
+**Console output** — clean one-liner per video:
+
+```
+============================================================
+  Download [train] — class_30_kiss  (50 videos)
+============================================================
+  [ 1/50]  OK    -ZFgsrolSxo  (S3 mirror, 366.9 MB)
+  [ 2/50]  SKIP  -OyDO1g74vc  (exists, 212.9 MB)
+  [ 3/50]  FAIL  0f39OWEqJ24  (all sources exhausted (S3+YouTube))
+────────────────────────────────────────────────────────────
+  Summary: 1 downloaded, 1 skipped, 1 failed  (total 3)
+────────────────────────────────────────────────────────────
+  Failed video IDs logged to: logs/failed_20260306_141523.json
+  Full log: logs/download_20260306_141523.log
+```
+
+**Failure logs** are saved as JSON in `logs/` with timestamps:
+
+```json
+{
+  "run_timestamp": "20260306_141523",
+  "split": "train",
+  "class_info": "class_30_kiss",
+  "summary": { "total": 50, "downloaded": 35, "skipped": 10, "failed": 5 },
+  "failed_videos": [
+    { "video_id": "0f39OWEqJ24", "error": "all sources exhausted (S3+YouTube)", "timestamp": "2026-03-06T14:15:30" }
+  ]
 }
 ```
 
-### Model (`config/training_config.py`)
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--class-dir` | — | Class directory from step 2 |
+| `--video-ids` | — | Path to a video-ID text file (alternative to `--class-dir`) |
+| `--verify-links` | — | Verify/repair hard links without downloading |
+| `--video-dir` | `data/raw_videos` | Shared directory for downloaded videos |
+| `--source` | `auto` | `mirror` = S3 only; `auto` = S3 + YouTube |
+| `--max-videos` | all | Limit number of videos |
+| `--no-skip-existing` | off | Force re-download |
+| `--delay` | 0.5 | Seconds between downloads (rate-limiting) |
 
-```python
-MODEL_CONFIG = {
-    "backbone": "yolov8m",     # no .pt extension here
-    "clip_len": 32,
-    "temporal_stride": 2,
-}
+### Step 3b: Verify & Repair Links
+
+If you downloaded videos separately or want to re-link and regenerate manifests:
+
+```bash
+python scripts/download_videos_v2.py --verify-links training_data/class_30_kiss
 ```
 
-### Backbone variants
+This will:
+- Scan `data/raw_videos/` for any videos matching the class's ID lists
+- Hard-link them into `training_data/class_30_kiss/videos/{train,val}/`
+- Regenerate manifests with correct file extensions
 
-| Variant | Params (approx.) | Speed | Recommended for |
-|---------|-----------------|-------|----------------|
-| `yolov8n.pt` | ~3 M | Fastest | Testing / low-VRAM |
+### Step 4: Extract Frames
+
+Extracts frames from the AVA annotated temporal window (seconds 902–1798).
+
+```bash
+python scripts/extract_frames.py \
+  --video-dir training_data/class_30_kiss/videos/train \
+  --frame-dir training_data/class_30_kiss/frames \
+  --annotation-dir data/annotations \
+  --fps 30 --img-size 416 \
+  --classes kiss
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--fps` | 30 | Frames per second to extract |
+| `--img-size` | 416 | Output frame resolution |
+| `--max-videos` | all | Limit for testing |
+| `--no-decord` | off | Use ffmpeg instead of Decord |
+
+### Step 5: Train the Model
+
+```bash
+python scripts/train_yolo_act.py \
+  --frame-dir training_data/class_30_kiss/frames \
+  --checkpoint-dir models/checkpoints \
+  --epochs 50 --batch-size 4 \
+  --classes kiss
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--epochs` | 100 | Number of epochs |
+| `--batch-size` | 4 | Batch size |
+| `--lr` | 0.0001 | Learning rate |
+| `--backbone` | `yolov8m.pt` | Backbone variant (`n`/`s`/`m`/`l`/`x`) |
+| `--device` | `cuda` | `cuda` or `cpu` |
+| `--no-amp` | off | Disable mixed-precision training |
+| `--resume` | — | Path to checkpoint to resume from |
+| `--auto-resume` | on | Auto-resume from `last_model.pth` |
+
+---
+
+## Project Structure
+
+```
+Campus-Sentintal/
+├── pipeline.py                        # One-command pipeline orchestrator
+├── requirements.txt
+├── config/
+│   ├── ava_classes.py                 # AVA 80 class IDs & mappings
+│   └── training_config.py            # Hyperparameters & model config
+├── scripts/
+│   ├── download_annotations.py       # Step 1: download AVA annotation zip
+│   ├── filter_annotations.py         # Step 2: filter by class, generate manifests
+│   ├── download_videos_v2.py         # Step 3: S3 mirror-first video downloader
+│   ├── extract_frames.py             # Step 4: video → frame extraction
+│   ├── train_yolo_act.py             # Step 5: model training
+│   ├── evaluate.py                   # AVA mAP evaluation
+│   ├── download_orchestrator.py      # (legacy) multi-source downloader
+│   ├── download_videos.py            # (legacy) class-filtered downloader
+│   └── validate_dataset.py           # Dataset integrity checker
+├── models/
+│   ├── yolo_act.py                   # YOLO-ACT: YOLOv8 backbone + temporal head
+│   └── checkpoints/                  # Saved model weights
+├── data/
+│   ├── annotations/                  # AVA v2.2 CSVs (auto-downloaded)
+│   └── raw_videos/                   # Shared video store (gitignored)
+├── training_data/
+│   └── class_<id>_<name>/            # Per-class output from filter + download
+│       ├── filtered_annotations/
+│       ├── video_ids/
+│       ├── manifests/
+│       ├── videos/{train,val}/       # Hard-linked from raw_videos (gitignored)
+│       └── frames/                   # Extracted frames
+├── logs/                             # Download & training logs (gitignored)
+└── tests/
+    ├── test_yolo_act.py              # 22 unit tests
+    └── test_download_orchestrator.py
+```
+
+---
+
+## Download Sources
+
+Videos are downloaded in this priority order:
+
+| Priority | Source | Format | Notes |
+|----------|--------|--------|-------|
+| 1 | **S3 AVA mirror** | `.mkv` → `.mp4` → `.webm` | `s3.amazonaws.com/ava-dataset/trainval/<id>.mkv` |
+| 2 | **YouTube** (yt-dlp) | `.mp4` | Only when `--source auto`; trimmed to 15:00–30:01 with ffmpeg |
+
+Downloaded videos are stored once in `data/raw_videos/` and **hard-linked** into `training_data/class_*/videos/{train,val}/` to avoid duplication.
+
+---
+
+## Logging
+
+| File | Location | Contents |
+|------|----------|----------|
+| Download log | `logs/download_<timestamp>.log` | Full debug-level download trace |
+| Failure log | `logs/failed_<timestamp>.json` | Structured list of failed video IDs with class info |
+
+---
+
+## Running Tests
+
+```bash
+# All tests
+python -m pytest tests/ -v
+
+# Specific test class
+python -m pytest tests/test_yolo_act.py::TestModelArchitecture -v
+```
+
+Expected: **22 passed** (~4 s).
+
+---
+
+## AVA Action Classes
+
+80 classes total. Common ones:
+
+| ID | Action | ID | Action |
+|----|--------|----|--------|
+| 9 | run/jog | 10 | sit |
+| 11 | stand | 13 | walk |
+| 20 | drink | 21 | eat |
+| 27 | hug | 29 | kick |
+| 30 | kiss | 42 | sit down |
+| 43 | stand up | 45 | throw |
+| 53 | fight | 3 | dance |
+
+Full list: [config/ava_classes.py](config/ava_classes.py)
+
+---
+
+## Backbone Variants
+
+| Variant | Params | Speed | Use case |
+|---------|--------|-------|----------|
+| `yolov8n.pt` | ~3 M | Fastest | Testing / low VRAM |
 | `yolov8s.pt` | ~11 M | Fast | Prototyping |
-| `yolov8m.pt` | ~25 M | Medium | **Default / balanced** |
-| `yolov8l.pt` | ~43 M | Slow | High-accuracy |
+| `yolov8m.pt` | ~25 M | Medium | **Default — balanced** |
+| `yolov8l.pt` | ~43 M | Slow | High accuracy |
 | `yolov8x.pt` | ~68 M | Slowest | Maximum accuracy |
 
 ---
 
-## 🏷️ AVA Dataset Classes
+## Troubleshooting
 
-The model trains on 80 AVA action categories (IDs 1–80). A selection of common classes and their IDs:
-
-| ID | Class | ID | Class |
-|----|-------|----|-------|
-| 9  | run/jog | 10 | sit |
-| 11 | stand | 13 | walk |
-| 27 | hug (a person) | 30 | kiss |
-| 29 | kick (a person) | 53 | fight (with person) |
-| 25 | hit (a person) | 45 | throw |
-| 43 | stand up | 42 | sit down |
-| 21 | eat | 20 | drink |
-
-Use `--classes` to filter to a subset:
-
-```bash
-python scripts/train_yolo_act.py --classes "walk,run,sit,jump,hug,kiss,fight"
-```
+| Problem | Solution |
+|---------|----------|
+| `ModuleNotFoundError: cv2` | `pip install opencv-python-headless` |
+| `ModuleNotFoundError: ultralytics` | `pip install ultralytics` |
+| `ffmpeg not found` | Install ffmpeg and add to `PATH` |
+| CUDA out of memory | `--batch-size 2 --backbone yolov8n.pt` |
+| Training on CPU | `--device cpu --no-amp` |
+| Empty frame directory | Run frame extraction first (step 4) |
+| Videos not linked to class dir | `python scripts/download_videos_v2.py --verify-links training_data/class_30_kiss` |
+| Manifest shows wrong extension | Re-run `--verify-links` to regenerate manifests |
 
 ---
 
-## 🔍 Troubleshooting
-
-### `ModuleNotFoundError: No module named 'cv2'`
-```bash
-pip install opencv-python-headless
-```
-
-### `ModuleNotFoundError: No module named 'ultralytics'`
-```bash
-pip install ultralytics
-```
-
-### `ModuleNotFoundError: No module named 'decord'`
-```bash
-pip install decord
-# or use ffmpeg fallback:
-python scripts/extract_frames.py --no-decord
-```
-
-### CUDA out of memory
-Reduce batch size or use a smaller backbone:
-```bash
-python scripts/train_yolo_act.py --batch-size 2 --backbone yolov8n.pt
-```
-
-### Training on CPU
-```bash
-python scripts/train_yolo_act.py --device cpu --no-amp
-```
-
-### `ValueError: num_samples should be a positive integer`
-The frame directory is empty. Run frame extraction first:
-```bash
-python scripts/extract_frames.py
-```
-
-### ffmpeg not found
-- **Windows**: Download from https://ffmpeg.org/download.html, extract, and add the `bin/` folder to your system `PATH`.
-- **Linux**: `sudo apt install ffmpeg`
-
-
-## 📁 Project Structure
-
-```
-d:/Campus/
-├── config/
-│   ├── ava_classes.py           # AVA 80 class mappings
-│   └── training_config.py       # Training hyperparameters
-├── scripts/
-│   ├── download_orchestrator.py  # Multi-source video downloader
-│   ├── validate_dataset.py       # Dataset validation
-│   ├── check_existing.py        # Check for existing videos
-│   ├── extract_frames.py        # Video to frame extraction
-│   └── train_yolo_act.py        # Model training script
-├── models/
-│   ├── yolo_act.py             # YOLO-ACT model (YOLOv8 + temporal)
-│   └── checkpoints/             # Saved model weights
-├── data/
-│   ├── raw_videos/             # Downloaded videos
-│   ├── frames/                  # Extracted frames
-│   └── annotations/             # AVA annotations
-├── pipeline.py                  # Main orchestration script
-├── requirements.txt            # Python dependencies
-└── README.md                   # This file
-```
-
-## 💾 Installation
-
-1. **Install system dependencies** (required):
-   ```bash
-   # Ubuntu/Debian
-   sudo apt install ffmpeg aria2
-   
-   # Windows (install ffmpeg manually and add to PATH)
-   ```
-
-2. **Create virtual environment** (recommended):
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # Linux/Mac
-   # or
-   venv\Scripts\activate     # Windows
-   ```
-
-3. **Install dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-4. **Verify CUDA availability**:
-   ```bash
-   python -c "import torch; print(f'CUDA: {torch.cuda.is_available()}')"
-   ```
-
-## 🚀 Quick Start
-
-### Option 1: Run Complete Pipeline
-
-```bash
-python pipeline.py
-```
-
-### Option 2: Custom Classes
-
-```bash
-python pipeline.py --classes kiss,hug,walk,run,sit,jump,fight
-```
-
-### Option 3: Step by Step
-
-```bash
-# Step 1: Download videos (multi-source with fallback)
-python scripts/download_orchestrator.py --classes kiss,hug,walk,run
-
-# Step 2: Validate dataset
-python scripts/validate_dataset.py
-
-# Step 3: Extract frames
-python scripts/extract_frames.py
-
-# Step 4: Train
-python scripts/train_yolo_act.py --epochs 50 --batch-size 4
-```
-
-## 🔧 Pipeline Components
-
-### 1. Video Download Orchestrator (`scripts/download_orchestrator.py`)
-
-Multi-source video download with priority:
-1. **CVDF / Facebook S3 Mirror** (Primary - pre-cut 15min clips)
-2. **HuggingFace Mirrors** (Community mirrors)
-3. **YouTube** (Fallback - with trimming to AVA's 15-minute segments)
-
-```bash
-python scripts/download_orchestrator.py --classes kiss,hug,walk,run
-```
-
-### 2. Dataset Validator (`scripts/validate_dataset.py`)
-
-Comprehensive validation:
-- Completeness check (expected vs downloaded)
-- Video integrity (not corrupted)
-- Duplicate detection (filename + content hash)
-- Annotation-video alignment
-
-```bash
-python scripts/validate_dataset.py
-```
-
-### 3. Frame Extractor (`scripts/extract_frames.py`)
-
-Extract frames from videos:
-
-```bash
-python scripts/extract_frames.py --fps 30 --img-size 416
-```
-
-### 4. Model Training (`scripts/train_yolo_act.py`)
-
-Train YOLO-ACT model:
-
-```bash
-python scripts/train_yolo_act.py --epochs 50 --batch-size 4
-```
-
-## 📖 Usage Examples
-
-### Training with Limited Data (Testing)
-
-```bash
-python pipeline.py --max-videos 10 --epochs 10 --batch-size 2
-```
-
-### Resume Training
-
-```bash
-python scripts/train_yolo_act.py --resume models/checkpoints/checkpoint_epoch_50.pth
-```
-
-### Custom Training Configuration
-
-```bash
-python pipeline.py \
-  --classes walk,run,sit,jump \
-  --epochs 50 \
-  --batch-size 4 \
-  --lr 0.001 \
-  --backbone yolov8m.pt
-```
-
-### CPU Training (No GPU)
-
-```bash
-python pipeline.py --device cpu
-```
-
-## ⚙️ Configuration
-
-### Training Parameters
-
-Edit `config/training_config.py`:
-
-```python
-TRAINING_CONFIG = {
-    "batch_size": 4,
-    "num_epochs": 50,
-    "learning_rate": 0.001,
-    "weight_decay": 0.0001,
-    "optimizer": "adamw",
-    "scheduler": "cosine",
-    "use_amp": True,
-}
-```
-
-### Model Configuration
-
-```python
-MODEL_CONFIG = {
-    "backbone": "yolov8m.pt",  # or yolov8s, yolov8l, yolov8x
-    "num_classes": 80,
-    "clip_len": 32,
-}
-```
-
-## 📚 AVA Dataset Classes
-
-The AVA dataset contains 80 action classes. Default selected classes include:
-
-| Class ID | Action |
-|----------|--------|
-| 30 | kiss |
-| 27 | hug |
-| 13 | walk |
-| 9 | run/jog |
-| 10 | sit |
-| 6 | jump/leap |
-| 53 | fight |
-| 3 | dance |
-| 21 | eat |
-| 20 | drink |
-| 11 | stand |
-| 7 | lie down |
-| 29 | kick |
-| 45 | throw |
-
-Full class list available in `config/ava_classes.py`
-
-## 🐛 Troubleshooting
-
-### Video Download Issues
-
-1. **CVDF S3 unavailable**: Script automatically falls back to HuggingFace
-2. **YouTube videos unavailable**: Some videos may have been removed
-3. **Use aria2 for faster downloads**: Already configured
-
-### CUDA Out of Memory
-
-Reduce batch size or image size:
-```bash
-python scripts/train_yolo_act.py --batch-size 2 --img-size 320
-```
-
-### Training Takes Too Long
-
-1. Enable mixed precision: Already enabled by default
-2. Reduce epochs for testing
-3. Use smaller backbone: `--backbone yolov8n.pt`
-
-### Dataset Validation Fails
-
-- Ensure videos downloaded completely
-- Run: `python scripts/validate_dataset.py --resolve-duplicates`
-
-## 📝 Notes
-
-- Videos are downloaded from **official mirrors** (CVDF S3, HuggingFace), NOT directly from YouTube (except as fallback)
-- AVA videos are 15-minute clips extracted from movies/TV shows
-- The validation script checks for corruption and duplicates
-- Multi-GPU training is supported with `--multi-gpu` flag
-
-## 📎 References
-
-- [YOLO-ACT Paper](link-to-paper)
-- [AVA Dataset](https://research.google.com/ava/)
-- [CVDF Mirror](https://s3.amazonaws.com/ava-dataset/)
-- [ActivityNet](http://activity-net.org/)
+## References
+
+- [AVA Dataset](https://research.google.com/ava/) — Google Research
+- [AVA S3 Mirror](https://s3.amazonaws.com/ava-dataset/) — Primary download source
+- [YOLOv8 (Ultralytics)](https://docs.ultralytics.com/) — Backbone
+- [ActivityNet](http://activity-net.org/) — Benchmark
