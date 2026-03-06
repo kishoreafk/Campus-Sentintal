@@ -5,10 +5,10 @@ AVA Video Downloader with Class Filtering
 Downloads videos from AVA dataset official sources with support for:
 - Class/action filtering (only download videos containing selected actions)
 - Duplicate avoidance (skip existing videos)
-- Multiple download sources (Google Cloud Storage, AWS, etc.)
+- Multiple download sources (CVDF mirror, Google Cloud Storage, etc.)
 
 IMPORTANT: This script downloads from official AVA dataset mirrors, NOT YouTube.
-The AVA dataset videos are hosted on Google Cloud Storage and other official sources.
+The AVA dataset videos are hosted on the CVDF mirror and other official sources.
 
 Usage:
     python scripts/download_videos.py --classes kiss,hug,walk,run
@@ -47,14 +47,20 @@ logger = logging.getLogger(__name__)
 
 
 # Official AVA Video Download Sources (NOT YouTube)
+# Verified working pattern: https://s3.amazonaws.com/ava-dataset/trainval/<video_id>.mkv
 AVA_VIDEO_SOURCES = {
-    # Google Cloud Storage - Primary source
-    "gcs_base": "https://storage.googleapis.com/ava-dataset/",
-    
-    # Alternative mirrors
+    # CVDF / official S3 mirror - Primary source (trainval/ prefix, .mkv format)
+    "cvdf_base": "https://s3.amazonaws.com/ava-dataset/",
     "aws_base": "https://ava-dataset.s3.amazonaws.com/",
-    "github_base": "https://github.com/activitynet/ActivityNet/raw/master/Crawler/ava/videos/",
+    # Fallback mirrors
+    "gcs_base": "https://storage.googleapis.com/ava-dataset/",
 }
+
+ANNOTATION_MIRRORS = [
+    "https://s3.amazonaws.com/ava-dataset/annotations",
+    "https://ava-dataset.s3.amazonaws.com/annotations",
+    "https://storage.googleapis.com/ava-dataset/annotations",
+]
 
 # AVA video file naming convention
 # Videos are named by their YouTube ID but downloaded from official sources
@@ -71,7 +77,7 @@ class AVAVideoDownloader:
         selected_classes: Optional[List[str]] = None,
         quality: str = "best[height<=720]",
         skip_existing: bool = True,
-        download_source: str = "gcs"  # gcs, aws, github, original
+        download_source: str = "cvdf"  # cvdf, aws, gcs, github, original, all
     ):
         self.video_dir = Path(video_dir)
         self.annotation_dir = Path(annotation_dir)
@@ -112,21 +118,25 @@ class AVAVideoDownloader:
         
         # Download annotation files
         for filename in ["ava_train_v2.2.csv", "ava_val_v2.2.csv"]:
-            url = f"{AVA_ANNOTATIONS_URL}/{filename}"
             dest = self.annotation_dir / filename
-            
-            try:
-                logger.info(f"Downloading {filename}...")
-                # Useurllib with timeout
-                request = urllib.request.Request(url)
-                request.add_header('User-Agent', 'Mozilla/5.0')
-                with urllib.request.urlopen(request, timeout=30) as response:
-                    with open(dest, 'wb') as f:
-                        f.write(response.read())
-                logger.info(f"Downloaded {filename}")
-            except Exception as e:
-                logger.warning(f"Could not download {filename}: {e}")
-                # Create sample annotation file if download fails
+
+            downloaded = False
+            for base_url in [AVA_ANNOTATIONS_URL, *ANNOTATION_MIRRORS]:
+                url = f"{base_url.rstrip('/')}/{filename}"
+                try:
+                    logger.info(f"Downloading {filename} from {url}...")
+                    request = urllib.request.Request(url)
+                    request.add_header('User-Agent', 'Mozilla/5.0')
+                    with urllib.request.urlopen(request, timeout=30) as response:
+                        with open(dest, 'wb') as f:
+                            f.write(response.read())
+                    logger.info(f"Downloaded {filename}")
+                    downloaded = True
+                    break
+                except Exception as e:
+                    logger.warning(f"Could not download {filename} from {url}: {e}")
+
+            if not downloaded:
                 self._create_sample_annotations(dest, filename)
         
         return train_file, val_file
@@ -158,11 +168,14 @@ class AVAVideoDownloader:
         with open(train_file, 'r') as f:
             for line in f:
                 parts = line.strip().split(',')
-                if len(parts) >= 5:
+                if len(parts) >= 7:
                     video_id = parts[0]
                     timestamp = parts[1]
-                    person_id = parts[2]
-                    action_id = int(parts[3])
+                    # AVA CSV: video_id(0), ts(1), x1(2), y1(3), x2(4), y2(5), action_id(6), person_id(7)
+                    try:
+                        action_id = int(parts[6])
+                    except ValueError:
+                        continue
                     
                     # Filter by class if specified
                     if self.filter_class_ids and action_id not in self.filter_class_ids:
@@ -171,7 +184,7 @@ class AVAVideoDownloader:
                     annotations["train"].append({
                         "video_id": video_id,
                         "timestamp": timestamp,
-                        "person_id": person_id,
+                        "person_id": parts[7] if len(parts) > 7 else "",
                         "action_id": action_id,
                         "action_name": AVA_CLASSES.get(action_id, "unknown")
                     })
@@ -218,44 +231,50 @@ class AVAVideoDownloader:
         return videos_to_download
     
     def get_video_url(self, video_id: str) -> Optional[str]:
-        """Get the official AVA video URL for a given video ID
-        
-        AVA videos are available from multiple sources:
-        1. Google Cloud Storage (primary)
-        2. AWS (mirror)
-        3. Direct video files from movie clips
-        
-        Returns None if video is not available from official sources.
+        """Get the official AVA video URL for a given video ID.
+
+        Verified working pattern:
+            https://s3.amazonaws.com/ava-dataset/trainval/<video_id>.mkv
+
+        Videos are predominantly .mkv under the trainval/ prefix on S3.
+        We try .mkv first, then .mp4 as a fallback, across all mirrors.
         """
-        # Try different sources based on configuration
-        sources_to_try = []
-        
-        if self.download_source == "gcs":
-            sources_to_try = [
-                f"https://storage.googleapis.com/ava-dataset/videos/{video_id}.mp4",
-                f"https://storage.googleapis.com/ava-dataset/{video_id}.mp4",
-            ]
-        elif self.download_source == "aws":
-            sources_to_try = [
-                f"https://ava-dataset.s3.amazonaws.com/{video_id}.mp4",
-                f"https://s3.amazonaws.com/ava-dataset/{video_id}.mp4",
-            ]
-        elif self.download_source == "original":
-            # Try to get from original video sources
+        # Build candidate list – .mkv under trainval/ is the confirmed pattern.
+        sources_to_try: List[str] = []
+
+        if self.download_source in ("cvdf", "all"):
+            for ext in ("mkv", "mp4"):
+                sources_to_try.append(
+                    f"{AVA_VIDEO_SOURCES['cvdf_base']}trainval/{video_id}.{ext}"
+                )
+
+        if self.download_source in ("aws", "all"):
+            for ext in ("mkv", "mp4"):
+                sources_to_try.append(
+                    f"{AVA_VIDEO_SOURCES['aws_base']}trainval/{video_id}.{ext}"
+                )
+
+        if self.download_source in ("gcs", "all"):
+            for ext in ("mkv", "mp4"):
+                sources_to_try.append(
+                    f"{AVA_VIDEO_SOURCES['gcs_base']}trainval/{video_id}.{ext}"
+                )
+
+        if self.download_source == "original":
             sources_to_try = self._get_original_video_url(video_id)
-        else:
-            # Try all sources
-            sources_to_try = [
-                f"https://storage.googleapis.com/ava-dataset/videos/{video_id}.mp4",
-                f"https://storage.googleapis.com/ava-dataset/{video_id}.mp4",
-                f"https://ava-dataset.s3.amazonaws.com/{video_id}.mp4",
-            ]
-        
+
+        # Default: if user picked 'cvdf' only, still include AWS alias
+        if self.download_source == "cvdf":
+            for ext in ("mkv", "mp4"):
+                sources_to_try.append(
+                    f"{AVA_VIDEO_SOURCES['aws_base']}trainval/{video_id}.{ext}"
+                )
+
         # Check which source is accessible
         for url in sources_to_try:
             if self._check_url_exists(url):
                 return url
-        
+
         return None
     
     def _get_original_video_url(self, video_id: str) -> List[str]:
@@ -280,7 +299,7 @@ class AVAVideoDownloader:
         
         # Check if video already exists
         if self.skip_existing:
-            for ext in ['.mp4', '.webm', '.avi', '.mkv', '.mov']:
+            for ext in ['.mkv', '.mp4', '.webm', '.avi', '.mov']:
                 if (self.video_dir / f"{video_id}{ext}").exists():
                     logger.info(f"Video {video_id} already exists, skipping")
                     self.download_stats["existing"] += 1
@@ -301,7 +320,9 @@ class AVAVideoDownloader:
                 logger.info(f"Downloading {video_id} (attempt {attempt + 1}/{max_retries})")
                 logger.info(f"Source: {video_url}")
                 
-                output_path = self.video_dir / f"{video_id}.mp4"
+                # Derive file extension from the source URL
+                url_ext = Path(video_url.split("?")[0]).suffix or ".mkv"
+                output_path = self.video_dir / f"{video_id}{url_ext}"
                 
                 # Download with progress
                 self._download_with_progress(video_url, output_path)
@@ -384,11 +405,11 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Download videos for specific classes from Google Cloud Storage
+  # Download videos for specific classes from the CVDF mirror
   python scripts/download_videos.py --classes kiss,hug,walk,run
   
-  # Download from AWS mirror
-  python scripts/download_videos.py --classes kiss,hug,walk,run --source aws
+  # Force Google Cloud fallback
+  python scripts/download_videos.py --classes kiss,hug,walk,run --source gcs
   
   # Check existing videos without downloading
   python scripts/download_videos.py --check-only
@@ -396,7 +417,7 @@ Examples:
   # Download all classes
   python scripts/download_videos.py --all
 
-NOTE: AVA videos are downloaded from official sources (Google Cloud Storage, AWS),
+NOTE: AVA videos are downloaded from official sources (CVDF, AWS, Google Cloud Storage),
 NOT from YouTube. Some videos may not be available from mirrors and may need
 to be obtained from the original movie/TV sources.
         """
@@ -431,9 +452,9 @@ to be obtained from the original movie/TV sources.
     parser.add_argument(
         '--source',
         type=str,
-        default='gcs',
-        choices=['gcs', 'aws', 'original', 'all'],
-        help='Video download source (gcs=Google Cloud Storage, aws=AWS, original=direct sources)'
+        default='cvdf',
+        choices=['cvdf', 'gcs', 'aws', 'original', 'all'],
+        help='Video download source (cvdf=primary mirror, gcs=Google Cloud Storage, aws=AWS mirror, original=direct sources)'
     )
     
     parser.add_argument(

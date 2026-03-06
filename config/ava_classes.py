@@ -187,7 +187,8 @@ def get_class_ids_from_names(class_names):
     return sorted(set(class_ids))
 
 # AVA dataset file URLs
-AVA_ANNOTATIONS_URL = "https://storage.googleapis.com/ava-dataset/annotations"
+# Prefer the CVDF mirror first because it has been more reliable for AVA setup.
+AVA_ANNOTATIONS_URL = "https://s3.amazonaws.com/ava-dataset/annotations"
 
 # Required annotation files
 ANNOTATION_FILES = {

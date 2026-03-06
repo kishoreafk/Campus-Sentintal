@@ -18,6 +18,12 @@ import subprocess
 import json
 import time
 import hashlib
+import shutil
+import urllib.request
+import urllib.error
+import re
+import zipfile
+import tempfile
 from pathlib import Path
 from typing import List, Set, Dict, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -37,9 +43,34 @@ logger = logging.getLogger(__name__)
 
 # Download sources
 AVAILABLE_SOURCES = {
-    "cvdf": "https://s3.amazonaws.com/ava-dataset/trainval",
+    "cvdf": "https://s3.amazonaws.com/ava-dataset",
     "huggingface": "https://huggingface.co/datasets/Loie/AVA-dataset/resolve/main/videos/",
     "youtube": "https://www.youtube.com/watch?v=",
+}
+
+OFFICIAL_ANNOTATION_ZIP_URL = "https://s3.amazonaws.com/ava-dataset/annotations/ava_v2.2.zip"
+
+ANNOTATION_BASE_URLS = [
+    # Prefer S3 mirror first.
+    "https://s3.amazonaws.com/ava-dataset/annotations",
+    "https://ava-dataset.s3.amazonaws.com/annotations",
+    # Fallbacks
+    "https://storage.googleapis.com/ava-dataset/annotations",
+    "https://huggingface.co/datasets/Loie/AVA-dataset/resolve/main/annotations",
+    "https://huggingface.co/datasets/Loie/AVA-dataset/resolve/main",
+    # Legacy fallback only; should never be a hard dependency.
+    "https://dl.fbaipublicfiles.com/video-long-term-feature-banks/data/ava/annotations",
+]
+
+PROPOSAL_CANDIDATE_URLS = {
+    "ava_dense_proposals_train.FAIR.recall_93.9.pkl": [
+        "https://dl.fbaipublicfiles.com/video-long-term-feature-banks/data/ava/annotations/ava_dense_proposals_train.FAIR.recall_93.9.pkl",
+        "https://huggingface.co/datasets/Loie/AVA-dataset/resolve/main/annotations/ava_dense_proposals_train.FAIR.recall_93.9.pkl",
+    ],
+    "ava_dense_proposals_val.FAIR.recall_93.9.pkl": [
+        "https://dl.fbaipublicfiles.com/video-long-term-feature-banks/data/ava/annotations/ava_dense_proposals_val.FAIR.recall_93.9.pkl",
+        "https://huggingface.co/datasets/Loie/AVA-dataset/resolve/main/annotations/ava_dense_proposals_val.FAIR.recall_93.9.pkl",
+    ],
 }
 
 
@@ -62,10 +93,14 @@ class AVADownloadOrchestrator:
         
         # Create directories
         self.video_dir.mkdir(parents=True, exist_ok=True)
+        self.annotation_dir.mkdir(parents=True, exist_ok=True)
         
         # Status tracking
         self.status_file = self.video_dir / "download_status.json"
         self.status = self._load_status()
+
+        # Track raw/canonical filename variants from annotation lists
+        self.video_id_variants: Dict[str, Set[str]] = {}
         
         # Class filter
         self.filter_class_ids = set()
@@ -73,10 +108,24 @@ class AVADownloadOrchestrator:
             self.filter_class_ids = set(get_class_ids_from_names(selected_classes))
     
     def _load_status(self) -> Dict:
-        """Load previous download status"""
+        """Load previous download status, cleaning any garbage entries."""
         if self.status_file.exists():
-            with open(self.status_file) as f:
-                return json.load(f)
+            try:
+                with open(self.status_file) as f:
+                    raw = json.load(f)
+                # Only keep entries with valid video-ID-shaped keys
+                cleaned = {
+                    k: v for k, v in raw.items()
+                    if re.match(r"^[A-Za-z0-9_-]{8,20}$", k)
+                }
+                if len(cleaned) < len(raw):
+                    logger.info(
+                        f"Cleaned {len(raw) - len(cleaned)} invalid entries "
+                        "from download_status.json"
+                    )
+                return cleaned
+            except (json.JSONDecodeError, TypeError):
+                logger.warning("Corrupt download_status.json — starting fresh.")
         return {}
     
     def _save_status(self):
@@ -87,89 +136,492 @@ class AVADownloadOrchestrator:
     def download_annotations(self):
         """Download AVA annotations"""
         logger.info("Downloading AVA annotations...")
-        
-        # Try official Google source first
-        google_base = "https://research.google.com/ava/download"
-        
-        # Also try FAIR mirror
-        fair_base = "https://dl.fbaipublicfiles.com/video-long-term-feature-banks/data/ava/annotations"
-        
+
         files_to_download = [
-            ("ava_train_v2.2.csv", google_base),
-            ("ava_val_v2.2.csv", google_base),
-            ("ava_action_list_v2.2_for_activitynet_2019.pbtxt", google_base),
-            ("ava_train_excluded_timestamps_v2.2.csv", google_base),
-            ("ava_val_excluded_timestamps_v2.2.csv", google_base),
-            ("ava_file_names_trainval_v2.1.txt", google_base),
+            "ava_train_v2.2.csv",
+            "ava_val_v2.2.csv",
+            "ava_action_list_v2.2_for_activitynet_2019.pbtxt",
+            "ava_train_excluded_timestamps_v2.2.csv",
+            "ava_val_excluded_timestamps_v2.2.csv",
+            "ava_file_names_trainval_v2.1.txt",
         ]
-        
-        for filename, base_url in files_to_download:
+
+        # Prefer the official Google bundle first. It is the most reliable path
+        # for the core AVA v2.2 annotation files.
+        self._download_official_annotation_bundle(files_to_download)
+
+        for filename in files_to_download:
             dest = self.annotation_dir / filename
-            if dest.exists():
+            if self._validate_annotation_file(dest, filename):
+                logger.info(f"Annotation ready: {filename}")
                 continue
-                
-            urls = [
-                f"{base_url}/{filename}",
-                f"{fair_base}/{filename}",
-            ]
-            
-            for url in urls:
-                try:
-                    logger.info(f"Downloading {filename} from {url}")
-                    result = subprocess.run(
-                        ["curl", "-L", "-o", str(dest), url],
-                        capture_output=True, timeout=60
-                    )
-                    if result.returncode == 0 and dest.exists():
-                        logger.info(f"Downloaded {filename}")
-                        break
-                except Exception as e:
-                    logger.warning(f"Failed to download {filename}: {e}")
-        
-        # Download proposal files
-        proposal_urls = [
-            ("https://dl.fbaipublicfiles.com/video-long-term-feature-banks/data/ava/annotations/ava_dense_proposals_train.FAIR.recall_93.9.pkl",
-             "data/ava/proposals/"),
-            ("https://dl.fbaipublicfiles.com/video-long-term-feature-banks/data/ava/annotations/ava_dense_proposals_val.FAIR.recall_93.9.pkl",
-             "data/ava/proposals/"),
+
+            if self._download_and_validate_annotation(filename, dest):
+                logger.info(f"Annotation ready: {filename}")
+            else:
+                logger.error(
+                    f"Could not obtain valid annotation file: {filename}. "
+                    "Subsequent steps may fail until this file is available."
+                )
+
+        self._download_proposals()
+
+    def _download_official_annotation_bundle(self, required_filenames: List[str]) -> bool:
+        """Download and extract the official AVA v2.2 annotation zip."""
+        bundle_members = {
+            "ava_train_v2.2.csv",
+            "ava_val_v2.2.csv",
+            "ava_action_list_v2.2_for_activitynet_2019.pbtxt",
+            "ava_train_excluded_timestamps_v2.2.csv",
+            "ava_val_excluded_timestamps_v2.2.csv",
+        }
+        missing = [
+            name for name in required_filenames
+            if name in bundle_members
+            and not self._validate_annotation_file(self.annotation_dir / name, name)
         ]
-        
-        for url, dest_dir in proposal_urls:
-            Path(dest_dir).mkdir(parents=True, exist_ok=True)
-            filename = Path(url).name
-            dest = Path(dest_dir) / filename
-            if dest.exists():
-                continue
+        if not missing:
+            return True
+
+        with tempfile.TemporaryDirectory(prefix="ava_annotations_") as temp_dir:
+            zip_path = Path(temp_dir) / "ava_v2.2.zip"
+            logger.info(f"Downloading official AVA annotation bundle from {OFFICIAL_ANNOTATION_ZIP_URL}")
+            if not self._download_file(OFFICIAL_ANNOTATION_ZIP_URL, zip_path, timeout=300):
+                logger.warning("Official AVA annotation bundle download failed. Falling back to per-file mirrors.")
+                return False
+
             try:
-                subprocess.run(["curl", "-L", "-o", str(dest), url], timeout=300)
-            except Exception as e:
-                logger.warning(f"Failed to download proposal: {e}")
+                with zipfile.ZipFile(zip_path) as zf:
+                    available_names = set(zf.namelist())
+                    for filename in missing:
+                        if filename not in available_names:
+                            logger.warning(f"{filename} not present in official AVA bundle.")
+                            continue
+
+                        dest = self.annotation_dir / filename
+                        zf.extract(filename, path=self.annotation_dir)
+                        if self._validate_annotation_file(dest, filename):
+                            logger.info(f"Extracted {filename} from official AVA bundle")
+                        else:
+                            logger.warning(f"Extracted {filename} from official bundle but validation failed")
+                            dest.unlink(missing_ok=True)
+            except zipfile.BadZipFile:
+                logger.warning("Official AVA annotation bundle is corrupt or unreadable.")
+                return False
+
+        return True
+
+    def _build_annotation_candidates(self, filename: str) -> List[str]:
+        """Build ordered candidate URLs for an annotation file."""
+        return [f"{base.rstrip('/')}/{filename}" for base in ANNOTATION_BASE_URLS]
+
+    def _looks_like_html_error(self, path: Path) -> bool:
+        """Detect HTML/error payloads saved as data files."""
+        try:
+            with open(path, "rb") as f:
+                header = f.read(4096).decode("utf-8", errors="ignore").lower()
+        except Exception:
+            return True
+
+        return (
+            "<!doctype html" in header
+            or "<html" in header
+            or "<title>error" in header
+        )
+
+    def _validate_annotation_file(self, path: Path, filename: str) -> bool:
+        """Validate annotation file content to avoid accepting HTTP error payloads."""
+        if not path.exists() or path.stat().st_size == 0:
+            return False
+
+        if self._looks_like_html_error(path):
+            return False
+
+        try:
+            if filename in {"ava_train_v2.2.csv", "ava_val_v2.2.csv"}:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        row = line.strip()
+                        if not row:
+                            continue
+                        parts = row.split(",")
+                        if len(parts) < 7:
+                            continue
+                        if not re.match(r"^[A-Za-z0-9_-]{8,20}$", parts[0].strip()):
+                            continue
+                        if not parts[1].strip().isdigit():
+                            continue
+                        return True
+                return False
+
+            if filename in {
+                "ava_train_excluded_timestamps_v2.2.csv",
+                "ava_val_excluded_timestamps_v2.2.csv",
+            }:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        row = line.strip()
+                        if not row:
+                            continue
+                        parts = row.split(",")
+                        if len(parts) >= 2 and parts[1].strip().isdigit():
+                            return True
+                return False
+
+            if filename == "ava_file_names_trainval_v2.1.txt":
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        raw = line.strip()
+                        if not raw:
+                            continue
+                        normalized = self._normalize_video_id(raw)
+                        if re.match(r"^[A-Za-z0-9_-]{8,20}$", normalized):
+                            return True
+                return False
+
+            if filename.endswith(".pbtxt"):
+                text = path.read_text(encoding="utf-8", errors="ignore")
+                return ("item {" in text) and ("name:" in text) and ("id:" in text)
+
+            return path.stat().st_size > 32
+        except Exception:
+            return False
+
+    def _download_and_validate_annotation(self, filename: str, dest: Path) -> bool:
+        """Download a single annotation file with strict validation and mirror fallback."""
+        if dest.exists():
+            if self._validate_annotation_file(dest, filename):
+                return True
+            logger.warning(f"Existing {filename} is invalid. Re-downloading.")
+            dest.unlink(missing_ok=True)
+
+        for url in self._build_annotation_candidates(filename):
+            logger.info(f"Downloading {filename} from {url}")
+            ok = self._download_file(url, dest, timeout=120)
+            if not ok:
+                continue
+
+            if self._validate_annotation_file(dest, filename):
+                return True
+
+            logger.warning(
+                f"Downloaded payload for {filename} from {url} is invalid "
+                "(likely HTML/error content). Trying next mirror."
+            )
+            dest.unlink(missing_ok=True)
+
+        return False
+
+    def _download_proposals(self):
+        """Best-effort proposal file downloads. Failures do not abort setup."""
+        proposal_dir = Path("data/ava/proposals")
+        proposal_dir.mkdir(parents=True, exist_ok=True)
+
+        for filename, urls in PROPOSAL_CANDIDATE_URLS.items():
+            dest = proposal_dir / filename
+            if dest.exists() and dest.stat().st_size > 1024:
+                continue
+
+            if dest.exists() and dest.stat().st_size <= 1024:
+                dest.unlink(missing_ok=True)
+
+            downloaded = False
+            for url in urls:
+                logger.info(f"Downloading proposal {filename} from {url}")
+                if self._download_file(url, dest, timeout=300):
+                    if dest.exists() and dest.stat().st_size > 1024:
+                        downloaded = True
+                        break
+                    logger.warning(
+                        f"Downloaded proposal {filename} from {url} appears incomplete."
+                    )
+                    dest.unlink(missing_ok=True)
+
+            if not downloaded:
+                logger.warning(
+                    f"Optional proposal file unavailable: {filename}. Continuing without it."
+                )
+
+    def _normalize_video_id(self, value: str) -> str:
+        """Normalize video identifier to a canonical AVA YouTube ID-style stem."""
+        cleaned = value.strip()
+        if not cleaned:
+            return ""
+
+        # Remove URL/query fragments and path prefixes if present
+        cleaned = cleaned.split("?")[0].split("#")[0].replace("\\", "/")
+        cleaned = Path(cleaned).name
+
+        # Strip known video extension if present
+        if Path(cleaned).suffix.lower() in {".mp4", ".mkv", ".webm", ".avi", ".mov"}:
+            cleaned = Path(cleaned).stem
+
+        return cleaned
+
+    def _register_video_variant(self, canonical_id: str, raw_value: str):
+        """Keep raw and canonical variants to build robust mirror URL candidates."""
+        if not canonical_id:
+            return
+
+        variants = self.video_id_variants.setdefault(canonical_id, set())
+        candidates = {
+            canonical_id,
+            raw_value.strip(),
+            Path(raw_value.strip().replace("\\", "/")).name,
+            self._normalize_video_id(raw_value),
+        }
+
+        for candidate in candidates:
+            if candidate:
+                variants.add(candidate)
+
+    def _url_is_available(self, url: str, timeout: int = 20) -> bool:
+        """Check URL availability using strict HTTP status validation."""
+        headers = {'User-Agent': 'Mozilla/5.0'}
+
+        # Try HEAD first
+        try:
+            request = urllib.request.Request(url, method='HEAD', headers=headers)
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return 200 <= response.status < 300
+        except urllib.error.HTTPError as e:
+            # Some endpoints disallow HEAD. Retry with a tiny ranged GET.
+            if e.code not in (403, 405):
+                return False
+        except Exception:
+            return False
+
+        # Fallback: ranged GET
+        try:
+            request = urllib.request.Request(url, headers={**headers, 'Range': 'bytes=0-0'})
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return response.status in (200, 206)
+        except Exception:
+            return False
+
+    def _download_file(self, url: str, output: Path, timeout: int = 600) -> bool:
+        """Download with aria2c fast-path, curl fallback, and stdlib HTTP fallback."""
+        output.parent.mkdir(parents=True, exist_ok=True)
+
+        # Try aria2c first if available
+        if shutil.which("aria2c"):
+            try:
+                result = subprocess.run([
+                    "aria2c", "-x", "16", "-s", "16", "-k", "1M",
+                    "-d", str(output.parent),
+                    "-o", output.name,
+                    url
+                ], timeout=timeout, capture_output=True, text=True)
+                if result.returncode == 0 and output.exists() and output.stat().st_size > 0:
+                    return True
+                self._log_download_failure(url, result)
+            except Exception:
+                pass
+
+        # Fallback to curl
+        try:
+            result = subprocess.run([
+                "curl", "-L", "--fail",
+                "--connect-timeout", "30",
+                "--max-time", str(timeout),
+                "--retry", "3",
+                "--retry-delay", "5",
+                "-o", str(output), url
+            ], timeout=timeout + 60, capture_output=True, text=True)
+            if result.returncode == 0 and output.exists() and output.stat().st_size > 0:
+                return True
+            self._log_download_failure(url, result)
+        except Exception:
+            pass
+
+        # Final fallback: Python stdlib streaming download.
+        try:
+            request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                with open(output, "wb") as f:
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+
+            if output.exists() and output.stat().st_size > 0:
+                return True
+        except Exception as exc:
+            logger.warning(f"Python fallback download failed for {url}: {exc}")
+
+        # Cleanup partial file if download failed
+        if output.exists() and output.stat().st_size <= 0:
+            output.unlink(missing_ok=True)
+
+        return False
+
+    def _log_download_failure(self, url: str, result: subprocess.CompletedProcess):
+        """Emit actionable logs for common network/download failure classes."""
+        stderr = (result.stderr or "").strip()
+        stdout = (result.stdout or "").strip()
+        combined = f"{stderr}\n{stdout}".lower()
+
+        if "curl: (28)" in combined or "timed out" in combined:
+            logger.warning(f"Timeout/unreachable host while downloading {url}")
+            return
+
+        if "curl: (22)" in combined or "http response code" in combined or "requested url returned error" in combined:
+            logger.warning(f"HTTP error while downloading {url}")
+            return
+
+        logger.warning(f"Download failed for {url} (exit={result.returncode})")
+
+    def _build_cvdf_candidates(self, video_id: str) -> List[str]:
+        """Build robust URL candidates for CVDF mirror.
+
+        The verified working pattern is:
+            https://s3.amazonaws.com/ava-dataset/trainval/<video_id>.mkv
+        We put that first, then try other extension/prefix combinations.
+        """
+        base = AVAILABLE_SOURCES["cvdf"].rstrip("/")
+        variants = self.video_id_variants.get(video_id, {video_id})
+        known_exts = {".mkv", ".mp4", ".webm", ".avi"}
+        # .mkv is the dominant format on the S3 mirror; try it first.
+        exts_to_try = ["mkv", "mp4", "webm"]
+        # trainval/ is the confirmed working prefix.
+        prefixes = ["trainval/", "test/", ""]
+
+        candidates: List[str] = []
+        seen: set = set()
+
+        def _add(url: str):
+            if url not in seen:
+                seen.add(url)
+                candidates.append(url)
+
+        # Highest-priority: trainval/<video_id>.mkv (verified pattern)
+        _add(f"{base}/trainval/{video_id}.mkv")
+
+        # Then iterate variants deterministically (sorted for stability)
+        for variant in sorted(variants):
+            name = Path(variant.strip().replace("\\", "/")).name
+            if not name:
+                continue
+
+            has_ext = Path(name).suffix.lower() in known_exts
+            filenames = [name] if has_ext else [f"{name}.{ext}" for ext in exts_to_try]
+
+            for filename in filenames:
+                for prefix in prefixes:
+                    _add(f"{base}/{prefix}{filename}")
+
+        return candidates
+
+    def _build_huggingface_candidates(self, video_id: str) -> List[str]:
+        """Build robust URL candidates for HuggingFace mirror."""
+        base = AVAILABLE_SOURCES["huggingface"]
+        variants = self.video_id_variants.get(video_id, {video_id})
+        known_exts = {".mkv", ".mp4", ".webm", ".avi"}
+        exts_to_try = ["mkv", "mp4"]
+
+        candidates = []
+        seen = set()
+
+        for variant in variants:
+            name = Path(variant.strip().replace("\\", "/")).name
+            if not name:
+                continue
+
+            has_ext = Path(name).suffix.lower() in known_exts
+            filenames = [name] if has_ext else [f"{name}.{ext}" for ext in exts_to_try]
+
+            for filename in filenames:
+                url = f"{base}{filename}"
+                if url not in seen:
+                    seen.add(url)
+                    candidates.append(url)
+
+        return candidates
     
+    @staticmethod
+    def _is_valid_video_id(video_id: str) -> bool:
+        """Check if a string looks like a valid AVA YouTube-style video ID."""
+        return bool(re.match(r"^[A-Za-z0-9_-]{8,20}$", video_id))
+
+    def _video_ids_from_csv(self, csv_path: Path) -> List[str]:
+        """Extract unique video IDs from an AVA annotation CSV file."""
+        video_ids = []
+        seen: set = set()
+        with open(csv_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                parts = line.strip().split(",")
+                if len(parts) < 4:
+                    continue
+                vid = self._normalize_video_id(parts[0])
+                if vid and self._is_valid_video_id(vid) and vid not in seen:
+                    seen.add(vid)
+                    self._register_video_variant(vid, parts[0])
+                    video_ids.append(vid)
+        return video_ids
+
     def get_video_list(self) -> List[str]:
         """Get list of video IDs from annotations"""
         list_file = self.annotation_dir / "ava_file_names_trainval_v2.1.txt"
         
-        if not list_file.exists():
-            logger.error("Video list file not found")
+        video_ids: List[str] = []
+        seen: set = set()
+
+        if list_file.exists() and self._validate_annotation_file(list_file, list_file.name):
+            with open(list_file) as f:
+                for line in f:
+                    raw_value = line.strip()
+                    if not raw_value:
+                        continue
+
+                    normalized = self._normalize_video_id(raw_value)
+                    if not normalized or not self._is_valid_video_id(normalized):
+                        continue
+
+                    self._register_video_variant(normalized, raw_value)
+
+                    if normalized not in seen:
+                        seen.add(normalized)
+                        video_ids.append(normalized)
+        else:
+            # Fallback: extract video IDs from train/val CSV annotations
+            logger.warning(
+                "Video list file not found or invalid. "
+                "Falling back to video IDs from annotation CSVs."
+            )
+            for csv_name in ["ava_train_v2.2.csv", "ava_val_v2.2.csv"]:
+                csv_path = self.annotation_dir / csv_name
+                if csv_path.exists():
+                    for vid in self._video_ids_from_csv(csv_path):
+                        if vid not in seen:
+                            seen.add(vid)
+                            video_ids.append(vid)
+
+        if not video_ids:
+            logger.error("No valid video IDs found from any source")
             return []
-        
-        with open(list_file) as f:
-            video_ids = [line.strip() for line in f if line.strip()]
-        
+
         # Filter by selected classes if specified
         if self.filter_class_ids:
-            train_file = self.annotation_dir / "ava_train_v2.2.csv"
-            if train_file.exists():
-                filtered = set()
-                with open(train_file) as f:
+            filtered = set()
+            for csv_name in ["ava_train_v2.2.csv", "ava_val_v2.2.csv"]:
+                csv_path = self.annotation_dir / csv_name
+                if not csv_path.exists():
+                    continue
+                with open(csv_path) as f:
                     for line in f:
                         parts = line.strip().split(',')
-                        if len(parts) >= 4:
-                            video_id = parts[0]
-                            action_id = int(parts[3])
-                            if action_id in self.filter_class_ids:
-                                filtered.add(video_id)
-                video_ids = [v for v in video_ids if v in filtered]
+                        # AVA CSV: video_id(0), ts(1), x1(2), y1(3), x2(4), y2(5), action_id(6), person_id(7)
+                        if len(parts) < 7:
+                            continue
+                        video_id = self._normalize_video_id(parts[0])
+                        try:
+                            action_id = int(parts[6])
+                        except ValueError:
+                            continue
+                        if action_id in self.filter_class_ids:
+                            filtered.add(video_id)
+            video_ids = [v for v in video_ids if v in filtered]
         
         return video_ids
     
@@ -180,62 +632,56 @@ class AVADownloadOrchestrator:
                 return True
         return False
     
+    def _validate_downloaded_video(self, path: Path, min_size_mb: float = 1.0) -> bool:
+        """Check that a downloaded video file is large enough to be valid."""
+        if not path.exists():
+            return False
+        size_mb = path.stat().st_size / (1024 * 1024)
+        if size_mb < min_size_mb:
+            logger.warning(
+                f"Downloaded file {path.name} is only {size_mb:.1f} MB "
+                f"(min {min_size_mb} MB). Treating as incomplete."
+            )
+            path.unlink(missing_ok=True)
+            return False
+        return True
+
     def try_cvdf_source(self, video_id: str) -> bool:
         """Try downloading from CVDF / Facebook S3 mirror"""
-        base = AVAILABLE_SOURCES["cvdf"]
-        
-        # Try different extensions
-        for ext in ['mkv', 'mp4', 'webm']:
-            url = f"{base}/{video_id}.{ext}"
-            output = self.video_dir / f"{video_id}.{ext}"
-            
+        for url in self._build_cvdf_candidates(video_id):
+            ext = Path(url).suffix
+            output = self.video_dir / f"{video_id}{ext}"
+
             try:
-                # First check if URL exists
-                result = subprocess.run(
-                    ["curl", "-s", "-I", "-L", url],
-                    capture_output=True, text=True, timeout=30
-                )
-                
-                if "HTTP" in result.stdout and "200" in result.stdout:
-                    # Download with aria2c for faster speed
-                    subprocess.run([
-                        "aria2c", "-x", "16", "-s", "16", "-k", "1M",
-                        "-d", str(self.video_dir),
-                        "-o", f"{video_id}.{ext}",
-                        url
-                    ], timeout=600)
-                    
-                    if output.exists():
+                if not self._url_is_available(url):
+                    continue
+
+                logger.info(f"CVDF mirror candidate matched: {url}")
+                if self._download_file(url, output, timeout=1800):
+                    if self._validate_downloaded_video(output):
                         return True
             except Exception as e:
-                logger.debug(f"CVDF failed for {video_id}: {e}")
+                logger.debug(f"CVDF failed for {video_id} via {url}: {e}")
                 continue
         
         return False
     
     def try_huggingface_source(self, video_id: str) -> bool:
         """Try downloading from Hugging Face mirror"""
-        base = AVAILABLE_SOURCES["huggingface"]
-        
-        for ext in ['mkv', 'mp4']:
-            url = f"{base}{video_id}.{ext}"
-            output = self.video_dir / f"{video_id}.{ext}"
-            
+        for url in self._build_huggingface_candidates(video_id):
+            ext = Path(url).suffix
+            output = self.video_dir / f"{video_id}{ext}"
+
             try:
-                result = subprocess.run(
-                    ["curl", "-s", "-I", "-L", url],
-                    capture_output=True, text=True, timeout=30
-                )
-                
-                if "HTTP" in result.stdout and "200" in result.stdout:
-                    subprocess.run([
-                        "curl", "-L", "-o", str(output), url
-                    ], timeout=600)
-                    
-                    if output.exists():
+                if not self._url_is_available(url):
+                    continue
+
+                logger.info(f"HuggingFace mirror candidate matched: {url}")
+                if self._download_file(url, output, timeout=1800):
+                    if self._validate_downloaded_video(output):
                         return True
             except Exception as e:
-                logger.debug(f"HuggingFace failed for {video_id}: {e}")
+                logger.debug(f"HuggingFace failed for {video_id} via {url}: {e}")
                 continue
         
         return False

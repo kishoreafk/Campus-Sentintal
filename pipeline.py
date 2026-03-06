@@ -3,416 +3,330 @@
 YOLO-ACT Training Pipeline
 
 Complete pipeline to train YOLO-ACT model with AVA dataset:
-1. Download annotations
-2. Download videos with multi-source fallback
-3. Validate dataset (completeness, integrity, duplicates)
+1. Download annotations (S3 zip)
+2. Filter annotations for selected class
+3. Download videos (S3 mirror-first, YouTube fallback)
 4. Extract frames from videos
 5. Train the model
 
 Usage:
-    python pipeline.py
-    python pipeline.py --classes kiss,hug,walk,run,sit,jump,fight
-    python pipeline.py --skip-download --skip-extract
+    python pipeline.py --class-name kiss
+    python pipeline.py --class-id 30
+    python pipeline.py --class-name kiss --max-videos 10
+    python pipeline.py --class-name kiss --skip-download --skip-extract
 """
 
-import os
-import sys
 import argparse
 import logging
-import subprocess
+import os
+import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config.ava_classes import USER_SELECTED_CLASSES
+from config.ava_classes import AVA_CLASSES, COMMON_CLASSES, get_class_ids_from_names
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
 
 class Pipeline:
     """Main pipeline orchestrator"""
-    
+
     def __init__(
         self,
-        selected_classes: Optional[List[str]] = None,
-        video_dir: str = "data/raw_videos",
-        frame_dir: str = "data/frames",
+        class_id: int,
+        class_name: str,
         annotation_dir: str = "data/annotations",
+        video_dir: str = "data/raw_videos",
+        training_root: str = "training_data",
+        frame_dir: Optional[str] = None,
         checkpoint_dir: str = "models/checkpoints",
-        log_dir: str = "logs"
+        log_dir: str = "logs",
+        source: str = "auto",
     ):
-        self.selected_classes = selected_classes or USER_SELECTED_CLASSES
-        self.video_dir = video_dir
-        self.frame_dir = frame_dir
-        self.annotation_dir = annotation_dir
-        self.checkpoint_dir = checkpoint_dir
-        self.log_dir = log_dir
-        
-        # Create directories
-        self._create_directories()
-    
-    def _create_directories(self):
-        """Create necessary directories"""
-        dirs = [
-            self.video_dir,
-            self.frame_dir,
-            self.annotation_dir,
-            "data/ava/proposals",  # For proposal files
-            self.checkpoint_dir,
-            self.log_dir
-        ]
-        
-        for d in dirs:
-            Path(d).mkdir(parents=True, exist_ok=True)
-    
-    def run_step(self, step_name: str, command: List[str], env: dict = None):
-        """Run a pipeline step"""
-        logger.info(f"\n{'='*60}")
-        logger.info(f"STEP: {step_name}")
-        logger.info(f"{'='*60}")
-        
-        try:
-            result = subprocess.run(
-                command,
-                env=env or os.environ.copy(),
-                check=True,
-                capture_output=False
+        self.class_id = class_id
+        self.class_name = class_name
+        self.annotation_dir = Path(annotation_dir)
+        self.video_dir = Path(video_dir)
+        self.training_root = Path(training_root)
+        self.checkpoint_dir = Path(checkpoint_dir)
+        self.log_dir = Path(log_dir)
+        self.source = source
+
+        # Derive class output directory (matching filter_annotations.py)
+        import re
+        safe = re.sub(r"[^a-z0-9]+", "_", class_name.lower()).strip("_")
+        self.class_dir = self.training_root / f"class_{class_id}_{safe}"
+
+        # Frame dir defaults to inside the class directory
+        self.frame_dir = Path(frame_dir) if frame_dir else self.class_dir / "frames"
+
+        # Ensure directories exist
+        for d in (self.annotation_dir, self.video_dir, self.checkpoint_dir,
+                  self.log_dir, self.class_dir):
+            d.mkdir(parents=True, exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # Step 1: Download annotations
+    # ------------------------------------------------------------------
+    def download_annotations(self, force: bool = False) -> bool:
+        logger.info("=" * 60)
+        logger.info("STEP 1: Download AVA annotations")
+        logger.info("=" * 60)
+        from scripts.download_annotations import download_annotations
+        return download_annotations(self.annotation_dir, force=force)
+
+    # ------------------------------------------------------------------
+    # Step 2: Filter annotations for selected class
+    # ------------------------------------------------------------------
+    def filter_annotations(self) -> bool:
+        logger.info("=" * 60)
+        logger.info(f"STEP 2: Filter annotations for class {self.class_id} ({self.class_name})")
+        logger.info("=" * 60)
+        from scripts.filter_annotations import filter_annotations
+        class_dir, stats = filter_annotations(
+            annotation_dir=self.annotation_dir,
+            class_id=self.class_id,
+            class_name=self.class_name,
+            output_root=self.training_root,
+            video_dir=self.video_dir,
+        )
+        logger.info(f"Filter stats: {stats}")
+        return stats.get("train_videos", 0) > 0 or stats.get("val_videos", 0) > 0
+
+    # ------------------------------------------------------------------
+    # Step 3: Download videos
+    # ------------------------------------------------------------------
+    def download_videos(self, max_videos: Optional[int] = None) -> bool:
+        logger.info("=" * 60)
+        logger.info("STEP 3: Download videos")
+        logger.info("=" * 60)
+        from scripts.download_videos_v2 import download_videos, _read_id_file, _link_videos_to_class_dir
+
+        any_ok = False
+        for split in ("train", "val"):
+            id_file = self.class_dir / "video_ids" / f"{split}_video_ids.txt"
+            if not id_file.exists():
+                logger.warning(f"No {split} video ID list at {id_file}")
+                continue
+            ids = _read_id_file(id_file)
+            if not ids:
+                continue
+            logger.info(f"[{split}] {len(ids)} videos to download")
+            results = download_videos(
+                ids, self.video_dir,
+                source=self.source,
+                max_videos=max_videos,
             )
-            logger.info(f"Step '{step_name}' completed successfully")
-            return True
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Step '{step_name}' failed with code {e.returncode}")
-            return False
-    
-    def download_videos_orchestrator(self, max_videos: Optional[int] = None):
-        """Step 1: Download videos using multi-source orchestrator"""
-        
+            _link_videos_to_class_dir(results, self.class_dir, split)
+            ok = sum(1 for v in results.values() if v is not None)
+            if ok > 0:
+                any_ok = True
+        return any_ok
+
+    # ------------------------------------------------------------------
+    # Step 4: Extract frames
+    # ------------------------------------------------------------------
+    def extract_frames(self, fps: int = 30, img_size: int = 416,
+                       max_videos: Optional[int] = None) -> bool:
+        logger.info("=" * 60)
+        logger.info("STEP 4: Extract frames")
+        logger.info("=" * 60)
         cmd = [
-            sys.executable,
-            "scripts/download_orchestrator.py",
-            "--video-dir", self.video_dir,
-            "--annotation-dir", self.annotation_dir,
-            "--max-workers", "8"
-        ]
-        
-        if self.selected_classes:
-            cmd.extend(["--classes", ",".join(self.selected_classes)])
-        
-        if max_videos:
-            cmd.extend(["--max-videos", str(max_videos)])
-        
-        return self.run_step("Download Videos (Multi-Source)", cmd)
-    
-    def validate_dataset(self):
-        """Step 2: Validate dataset integrity"""
-        
-        cmd = [
-            sys.executable,
-            "scripts/validate_dataset.py",
-            "--video-dir", self.video_dir,
-            "--annotation-dir", self.annotation_dir
-        ]
-        
-        return self.run_step("Validate Dataset", cmd)
-    
-    def extract_frames(self, fps: int = 30, img_size: int = 416, max_videos: Optional[int] = None):
-        """Step 3: Extract frames from videos"""
-        
-        cmd = [
-            sys.executable,
-            "scripts/extract_frames.py",
-            "--video-dir", self.video_dir,
-            "--frame-dir", self.frame_dir,
-            "--annotation-dir", self.annotation_dir,
+            sys.executable, "scripts/extract_frames.py",
+            "--video-dir", str(self.class_dir / "videos" / "train"),
+            "--frame-dir", str(self.frame_dir),
+            "--annotation-dir", str(self.annotation_dir),
             "--fps", str(fps),
             "--img-size", str(img_size),
-            "--generate-annotations"
+            "--generate-annotations",
+            "--classes", self.class_name,
         ]
-        
         if max_videos:
             cmd.extend(["--max-videos", str(max_videos)])
-        
-        if self.selected_classes:
-            cmd.extend(["--classes", ",".join(self.selected_classes)])
-        
-        return self.run_step("Extract Frames", cmd)
-    
-    def train(
-        self,
-        epochs: int = 50,
-        batch_size: int = 4,
-        lr: float = 0.001,
-        img_size: int = 416,
-        backbone: str = "yolov8m.pt",
-        device: str = "cuda"
-    ):
-        """Step 4: Train the model"""
-        
+
+        import subprocess
+        r = subprocess.run(cmd, env=os.environ.copy())
+        return r.returncode == 0
+
+    # ------------------------------------------------------------------
+    # Step 5: Train
+    # ------------------------------------------------------------------
+    def train(self, epochs: int = 50, batch_size: int = 4, lr: float = 0.001,
+              img_size: int = 416, backbone: str = "yolov8m.pt",
+              device: str = "cuda") -> bool:
+        logger.info("=" * 60)
+        logger.info("STEP 5: Train model")
+        logger.info("=" * 60)
         cmd = [
-            sys.executable,
-            "scripts/train_yolo_act.py",
-            "--frame-dir", self.frame_dir,
-            "--checkpoint-dir", self.checkpoint_dir,
-            "--log-dir", self.log_dir,
+            sys.executable, "scripts/train_yolo_act.py",
+            "--frame-dir", str(self.frame_dir),
+            "--checkpoint-dir", str(self.checkpoint_dir),
+            "--log-dir", str(self.log_dir),
             "--epochs", str(epochs),
             "--batch-size", str(batch_size),
             "--lr", str(lr),
             "--img-size", str(img_size),
             "--backbone", backbone,
             "--device", device,
+            "--classes", self.class_name,
         ]
-        
-        if self.selected_classes:
-            cmd.extend(["--classes", ",".join(self.selected_classes)])
-        
-        return self.run_step("Train Model", cmd)
-    
+        import subprocess
+        r = subprocess.run(cmd, env=os.environ.copy())
+        return r.returncode == 0
+
+    # ------------------------------------------------------------------
+    # Run all steps
+    # ------------------------------------------------------------------
     def run(
         self,
         skip_download: bool = False,
-        skip_validate: bool = False,
+        skip_filter: bool = False,
+        skip_videos: bool = False,
         skip_extract: bool = False,
         skip_train: bool = False,
         max_videos: Optional[int] = None,
         epochs: int = 50,
         batch_size: int = 4,
-        **train_kwargs
+        **train_kwargs,
     ):
-        """Run the complete pipeline"""
-        
-        logger.info("="*60)
-        logger.info("YOLO-ACT TRAINING PIPELINE")
-        logger.info("="*60)
-        logger.info(f"Selected classes: {', '.join(self.selected_classes)}")
-        logger.info(f"Video directory: {self.video_dir}")
-        logger.info(f"Frame directory: {self.frame_dir}")
-        logger.info("="*60)
-        
-        # Step 1: Download videos
+        logger.info("=" * 60)
+        logger.info(f"YOLO-ACT PIPELINE — class {self.class_id}: {self.class_name}")
+        logger.info("=" * 60)
+
+        # Step 1
         if not skip_download:
-            logger.info("\n[Step 1/5] Downloading videos (multi-source)...")
-            self.download_videos_orchestrator(max_videos=max_videos)
+            if not self.download_annotations():
+                logger.error("Annotation download failed.")
+                return False
         else:
-            logger.info("\n[Step 1/5] Skipping video download...")
-        
-        # Step 2: Validate dataset
-        if not skip_validate and not skip_download:
-            logger.info("\n[Step 2/5] Validating dataset...")
-            self.validate_dataset()
+            logger.info("[Step 1] Skipped annotation download")
+
+        # Step 2
+        if not skip_filter:
+            self.filter_annotations()
         else:
-            logger.info("\n[Step 2/5] Skipping validation...")
-        
-        # Step 3: Extract frames
+            logger.info("[Step 2] Skipped annotation filtering")
+
+        # Step 3
+        if not skip_videos:
+            self.download_videos(max_videos=max_videos)
+        else:
+            logger.info("[Step 3] Skipped video download")
+
+        # Step 4
         if not skip_extract:
-            logger.info("\n[Step 3/5] Extracting frames...")
             self.extract_frames(max_videos=max_videos)
         else:
-            logger.info("\n[Step 3/5] Skipping frame extraction...")
-        
-        # Step 4: Train
+            logger.info("[Step 4] Skipped frame extraction")
+
+        # Step 5
         if not skip_train:
-            logger.info("\n[Step 4/5] Training model...")
-            self.train(
-                epochs=epochs,
-                batch_size=batch_size,
-                **train_kwargs
-            )
+            self.train(epochs=epochs, batch_size=batch_size, **train_kwargs)
         else:
-            logger.info("\n[Step 4/5] Skipping training...")
-        
-        # Step 5: Evaluation
-        logger.info("\n[Step 5/5] Pipeline complete!")
-        
-        logger.info("\n" + "="*60)
+            logger.info("[Step 5] Skipped training")
+
+        logger.info("=" * 60)
         logger.info("PIPELINE COMPLETE")
-        logger.info("="*60)
-        
+        logger.info("=" * 60)
         return True
 
 
+# ---------------------------------------------------------------------------
+# Resolve class
+# ---------------------------------------------------------------------------
+def _resolve_class(args):
+    if args.class_id:
+        cid = int(args.class_id)
+        if cid not in AVA_CLASSES:
+            logger.error(f"Unknown class id {cid}")
+            sys.exit(1)
+        return cid, AVA_CLASSES[cid]
+    if args.class_name:
+        name = args.class_name.strip().lower()
+        if name in COMMON_CLASSES:
+            cid = COMMON_CLASSES[name]
+            return cid, AVA_CLASSES[cid]
+        ids = get_class_ids_from_names([name])
+        if ids:
+            cid = ids[0]
+            return cid, AVA_CLASSES[cid]
+        logger.error(f"Cannot resolve class name '{args.class_name}'")
+        sys.exit(1)
+    logger.error("Provide --class-id or --class-name")
+    sys.exit(1)
+
+
 def parse_args():
-    """Parse command line arguments"""
-    parser = argparse.ArgumentParser(
+    p = argparse.ArgumentParser(
         description="YOLO-ACT Training Pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Run full pipeline with default settings
-  python pipeline.py
-  
-  # Download videos for specific classes
-  python pipeline.py --classes kiss,hug,walk,run,sit,jump,fight
-  
-  # Quick test with limited videos
-  python pipeline.py --max-videos 10 --epochs 10 --batch-size 2
-  
-  # Skip download and extraction, just train
-  python pipeline.py --skip-download --skip-validate --skip-extract
-        """
+  python pipeline.py --class-name kiss
+  python pipeline.py --class-id 30 --max-videos 10
+  python pipeline.py --class-name kiss --skip-download --skip-extract
+        """,
     )
-    
-    parser.add_argument(
-        '--classes', '-c',
-        type=str,
-        default=None,
-        help='Comma-separated action classes'
-    )
-    
-    parser.add_argument(
-        '--video-dir',
-        type=str,
-        default='data/raw_videos',
-        help='Directory for videos'
-    )
-    
-    parser.add_argument(
-        '--frame-dir',
-        type=str,
-        default='data/frames',
-        help='Directory for extracted frames'
-    )
-    
-    parser.add_argument(
-        '--annotation-dir',
-        type=str,
-        default='data/annotations',
-        help='Directory for annotations'
-    )
-    
-    parser.add_argument(
-        '--checkpoint-dir',
-        type=str,
-        default='models/checkpoints',
-        help='Directory for model checkpoints'
-    )
-    
-    parser.add_argument(
-        '--log-dir',
-        type=str,
-        default='logs',
-        help='Directory for logs'
-    )
-    
-    parser.add_argument(
-        '--max-videos',
-        type=int,
-        default=None,
-        help='Maximum number of videos to download'
-    )
-    
-    parser.add_argument(
-        '--epochs',
-        type=int,
-        default=50,
-        help='Number of training epochs'
-    )
-    
-    parser.add_argument(
-        '--batch-size',
-        type=int,
-        default=4,
-        help='Training batch size'
-    )
-    
-    parser.add_argument(
-        '--lr',
-        type=float,
-        default=0.001,
-        help='Learning rate'
-    )
-    
-    parser.add_argument(
-        '--img-size',
-        type=int,
-        default=416,
-        help='Input image size'
-    )
-    
-    parser.add_argument(
-        '--backbone',
-        type=str,
-        default='yolov8m.pt',
-        choices=['yolov8n.pt', 'yolov8s.pt', 'yolov8m.pt', 'yolov8l.pt', 'yolov8x.pt'],
-        help='YOLO backbone variant'
-    )
-    
-    parser.add_argument(
-        '--device',
-        type=str,
-        default='cuda',
-        help='Device (cuda or cpu)'
-    )
-    
-    parser.add_argument(
-        '--skip-download',
-        action='store_true',
-        help='Skip video download step'
-    )
-    
-    parser.add_argument(
-        '--skip-validate',
-        action='store_true',
-        help='Skip dataset validation step'
-    )
-    
-    parser.add_argument(
-        '--skip-extract',
-        action='store_true',
-        help='Skip frame extraction step'
-    )
-    
-    parser.add_argument(
-        '--skip-train',
-        action='store_true',
-        help='Skip training step'
-    )
-    
-    parser.add_argument(
-        '--verbose', '-v',
-        action='store_true',
-        help='Enable verbose logging'
-    )
-    
-    return parser.parse_args()
+
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--class-id", type=int, help="AVA action class ID (1-80)")
+    g.add_argument("--class-name", type=str, help="Action name (e.g. kiss, hug)")
+
+    p.add_argument("--annotation-dir", default="data/annotations")
+    p.add_argument("--video-dir", default="data/raw_videos")
+    p.add_argument("--training-root", default="training_data")
+    p.add_argument("--checkpoint-dir", default="models/checkpoints")
+    p.add_argument("--log-dir", default="logs")
+    p.add_argument("--source", default="auto", choices=["mirror", "auto"],
+                    help="Video source: mirror=S3 only, auto=S3+YouTube")
+    p.add_argument("--max-videos", type=int, default=None)
+    p.add_argument("--epochs", type=int, default=50)
+    p.add_argument("--batch-size", type=int, default=4)
+    p.add_argument("--lr", type=float, default=0.001)
+    p.add_argument("--img-size", type=int, default=416)
+    p.add_argument("--backbone", default="yolov8m.pt")
+    p.add_argument("--device", default="cuda")
+    p.add_argument("--skip-download", action="store_true")
+    p.add_argument("--skip-filter", action="store_true")
+    p.add_argument("--skip-videos", action="store_true")
+    p.add_argument("--skip-extract", action="store_true")
+    p.add_argument("--skip-train", action="store_true")
+    p.add_argument("-v", "--verbose", action="store_true")
+
+    return p.parse_args()
 
 
 def main():
-    """Main function"""
     args = parse_args()
-    
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
-    
-    # Parse classes
-    selected_classes = None
-    if args.classes:
-        selected_classes = [c.strip() for c in args.classes.split(',')]
-    else:
-        selected_classes = USER_SELECTED_CLASSES
-    
-    logger.info(f"Selected classes: {selected_classes}")
-    
-    # Create pipeline
+
+    class_id, class_name = _resolve_class(args)
+    logger.info(f"Target class: {class_id} — {class_name}")
+
     pipeline = Pipeline(
-        selected_classes=selected_classes,
-        video_dir=args.video_dir,
-        frame_dir=args.frame_dir,
+        class_id=class_id,
+        class_name=class_name,
         annotation_dir=args.annotation_dir,
+        video_dir=args.video_dir,
+        training_root=args.training_root,
         checkpoint_dir=args.checkpoint_dir,
-        log_dir=args.log_dir
+        log_dir=args.log_dir,
+        source=args.source,
     )
-    
-    # Run pipeline
-    success = pipeline.run(
+
+    ok = pipeline.run(
         skip_download=args.skip_download,
-        skip_validate=args.skip_validate,
+        skip_filter=args.skip_filter,
+        skip_videos=args.skip_videos,
         skip_extract=args.skip_extract,
         skip_train=args.skip_train,
         max_videos=args.max_videos,
@@ -421,10 +335,9 @@ def main():
         lr=args.lr,
         img_size=args.img_size,
         backbone=args.backbone,
-        device=args.device
+        device=args.device,
     )
-    
-    return 0 if success else 1
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

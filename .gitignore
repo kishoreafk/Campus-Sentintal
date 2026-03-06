@@ -8,4 +8,19 @@ data/raw_videos/
 data/frames/
 wandb/
 .pytest_cache/
+.venv/
+
+# Large / generated data — keep out of git
+training_data/videos/
+training_data/*/videos/
+data/annotations/*.csv
+*.mkv
+*.mp4
+*.webm
+*.avi
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
 

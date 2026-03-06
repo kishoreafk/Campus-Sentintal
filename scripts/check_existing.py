@@ -106,9 +106,13 @@ class VideoChecker:
         with open(train_file, 'r') as f:
             for line in f:
                 parts = line.strip().split(',')
-                if len(parts) >= 5:
+                if len(parts) >= 7:
                     video_id = parts[0]
-                    action_id = int(parts[3])
+                    # AVA CSV: video_id(0), ts(1), x1(2), y1(3), x2(4), y2(5), action_id(6), person_id(7)
+                    try:
+                        action_id = int(parts[6])
+                    except ValueError:
+                        continue
                     
                     # Filter by class if specified
                     if filter_class_ids and action_id not in filter_class_ids:
